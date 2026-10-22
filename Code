@@ -1,0 +1,206 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import time
+import sys
+import atexit
+import signal
+import subprocess
+import cv2
+import numpy as np
+import gpiozero
+from gpiozero import Button, DistanceSensor, Motor, Servo
+from gpiozero.pins.lgpio import LGPIOFactory
+
+gpiozero.Device.pin_factory = LGPIOFactory()
+
+# Hardware Pins - Actuators & Controls
+SERVO_PIN = 17
+MOTOR_IN1 = 23
+MOTOR_IN2 = 24
+MOTOR_ENA = 12
+START_BUTTON_PIN = 2
+
+# Hardware Pins - Ultrasonic Sensors (Trig, Echo)
+FRONT_TRIG, FRONT_ECHO = 22, 27
+LEFT_TRIG, LEFT_ECHO = 5, 6
+RIGHT_TRIG, RIGHT_ECHO = 13, 19
+REAR_TRIG, REAR_ECHO = 20, 21
+
+# Track & Lap Settings
+TOTAL_LAPS = 3
+MIN_MARKER_PIXELS = 1200
+
+# Device Initializations
+start_button = Button(START_BUTTON_PIN)
+servo = Servo(SERVO_PIN, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
+motor = Motor(forward=MOTOR_IN1, backward=MOTOR_IN2, enable=MOTOR_ENA)
+
+# Initialize 4 Distance Sensors
+sensor_front = DistanceSensor(echo=FRONT_ECHO, trigger=FRONT_TRIG, max_distance=2.0)
+sensor_left  = DistanceSensor(echo=LEFT_ECHO,  trigger=LEFT_TRIG,  max_distance=2.0)
+sensor_right = DistanceSensor(echo=RIGHT_ECHO, trigger=RIGHT_TRIG, max_distance=2.0)
+sensor_rear  = DistanceSensor(echo=REAR_ECHO,  trigger=REAR_TRIG,  max_distance=2.0)
+
+def force_pi5_pins_low():
+    """Forces RP1 hardware lines to 0V using Pi 5 native pinctrl on shutdown."""
+    print("\n[CLEANUP] Stopping motors and setting GPIO pins LOW...")
+    try:
+        motor.stop()
+        motor.close()
+    except Exception:
+        pass
+
+    for pin in (MOTOR_IN1, MOTOR_IN2, MOTOR_ENA):
+        try:
+            subprocess.run(["sudo", "pinctrl", "set", str(pin), "op", "dl"], check=False)
+        except Exception:
+            pass
+
+atexit.register(force_pi5_pins_low)
+
+def handle_exit_signals(sig, frame):
+    sys.exit(0)
+
+for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(sig, handle_exit_signals)
+
+def analyze_frame(cap):
+    ret, frame = cap.read()
+    if not ret:
+        return "none", False
+
+    h, w, _ = frame.shape
+    
+    crop_size = min(h, w) // 2
+    start_y = (h - crop_size) // 2
+    start_x = (w - crop_size) // 2
+    center_crop = frame[start_y : start_y + crop_size, start_x : start_x + crop_size]
+    bottom_crop = frame[int(h * 0.65) :, :]
+
+    hsv_center = cv2.cvtColor(center_crop, cv2.COLOR_BGR2HSV)
+    hsv_bottom = cv2.cvtColor(bottom_crop, cv2.COLOR_BGR2HSV)
+
+    # HSV Ranges: Pillars (Green / Red)
+    lower_green = np.array([35, 80, 80])
+    upper_green = np.array([85, 255, 255])
+    lower_red1, upper_red1 = np.array([0, 100, 80]), np.array([10, 255, 255])
+    lower_red2, upper_red2 = np.array([170, 100, 80]), np.array([180, 255, 255])
+
+    # HSV Ranges: Lap Markers (Orange / Blue)
+    lower_orange = np.array([5, 120, 120])
+    upper_orange = np.array([20, 255, 255])
+    lower_blue = np.array([100, 120, 100])
+    upper_blue = np.array([130, 255, 255])
+
+    mask_green = cv2.inRange(hsv_center, lower_green, upper_green)
+    mask_red = cv2.bitwise_or(
+        cv2.inRange(hsv_center, lower_red1, upper_red1),
+        cv2.inRange(hsv_center, lower_red2, upper_red2)
+    )
+    
+    pillar_color = "none"
+    green_count = cv2.countNonZero(mask_green)
+    red_count = cv2.countNonZero(mask_red)
+    if green_count > 800 and green_count > red_count:
+        pillar_color = "green"
+    elif red_count > 800 and red_count > green_count:
+        pillar_color = "red"
+
+    mask_orange = cv2.inRange(hsv_bottom, lower_orange, upper_orange)
+    mask_blue = cv2.inRange(hsv_bottom, lower_blue, upper_blue)
+    
+    line_detected = (cv2.countNonZero(mask_orange) > MIN_MARKER_PIXELS) or \
+                    (cv2.countNonZero(mask_blue) > MIN_MARKER_PIXELS)
+
+    return pillar_color, line_detected
+
+def reverse_and_turn():
+    """Safely reverses while monitoring the rear sensor."""
+    motor.stop()
+    time.sleep(0.1)
+
+    # Reverse only if clear behind
+    if sensor_rear.distance > 0.15:
+        motor.backward(speed=0.6)
+        time.sleep(1.0)
+
+    servo.max()
+    time.sleep(0.8)
+    motor.stop()
+    servo.value = 0
+    time.sleep(0.2)
+
+def main():
+    cap = None
+    completed_laps = 0
+    on_marker = False
+    last_lap_time = 0
+
+    try:
+        motor.stop()
+        servo.value = 0
+
+        print("Pi Booted. Waiting for START button (GPIO 2)...")
+        start_button.wait_for_press()
+        print("START pressed! Launching robot...")
+        time.sleep(0.5)
+
+        cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+        while completed_laps < TOTAL_LAPS:
+            current_time = time.time()
+            
+            dist_front = sensor_front.distance
+            dist_left  = sensor_left.distance
+            dist_right = sensor_right.distance
+
+            # Obstacle directly ahead
+            if dist_front < 0.15:
+                reverse_and_turn()
+                continue
+
+            target_speed = max(0.3, min(1.0, dist_front))
+            motor.forward(speed=target_speed)
+
+            pillar_color, line_detected = analyze_frame(cap)
+
+            # Steering Logic Priority: Color Pillar > Wall Centering
+            if pillar_color == "green":
+                servo.min()
+            elif pillar_color == "red":
+                servo.max()
+            else:
+                # Use side sensors to keep centered in the lane
+                diff = dist_left - dist_right
+                if abs(diff) > 0.10:
+                    steering_val = max(-1.0, min(1.0, diff * 2.0))
+                    servo.value = steering_val
+                else:
+                    servo.value = 0
+
+            # Lap Detection Logic
+            if line_detected and not on_marker:
+                if current_time - last_lap_time > 4.0:
+                    completed_laps += 1
+                    last_lap_time = current_time
+                    on_marker = True
+                    print(f"\n[LAP DETECTED] Completed Lap {completed_laps}/{TOTAL_LAPS}!")
+
+            elif not line_detected and on_marker:
+                on_marker = False
+
+            time.sleep(0.05)
+
+        print(f"\nSuccessfully finished {TOTAL_LAPS} full laps! Stopping robot...")
+
+    finally:
+        force_pi5_pins_low()
+        if cap is not None and cap.isOpened():
+            cap.release()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
